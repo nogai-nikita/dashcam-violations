@@ -19,3 +19,4 @@ venv/
 # scratch dev helpers
 scratch_*
 /test_sd_big/
+/test_sd_25/

@@ -271,7 +271,13 @@ def ingest(cfg: dict) -> None:
             os.replace(part, dest)
             part = None
             if icfg.get("set_readonly", True):
-                os.chmod(dest, 0o444)
+                try:
+                    os.chmod(dest, 0o444)
+                except OSError:
+                    # Network shares (CIFS/NFS) often pin file modes; the
+                    # pipeline never writes the original anyway, so don't let a
+                    # rejected chmod abort the clip's ingest.
+                    pass
 
             manifest = {
                 "clip_id": clip_id,
