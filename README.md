@@ -1,11 +1,13 @@
 # Dashcam Violation Pipeline
 
 A **local, file-based** pipeline that ingests dashcam footage and uses a local
-vision-language model (Ollama + `qwen3-vl:8b`) on an RTX 5070 to **propose other
-drivers' road-rule violations** for human approval. No cloud, no database — every
-finding is a plain `manifest.json` file.
+vision-language model (Qwen3-VL-8B, served on the GPU by **vLLM**) on an RTX 5070
+to **propose other drivers' road-rule violations** for human approval. No cloud,
+no database — every finding is a plain `manifest.json` file.
 
-See [SOLUTION.md](SOLUTION.md) for the full design rationale.
+See [SOLUTION.md](SOLUTION.md) for the full design rationale — including §2 on why
+vLLM replaced Ollama here (Ollama runs Qwen3-VL's vision encoder on CPU on a 12 GB
+card: ~2 min/clip vs ~4 s/clip with vLLM).
 
 ```
 SD card ─ingest─> organize ─detect (YOLO gate)─> review (VLM) ─> pending_review ─> human approve/reject
@@ -17,8 +19,8 @@ SD card ─ingest─> organize ─detect (YOLO gate)─> review (VLM) ─> pendi
 
 ```
 .
-├── docker-compose.yml      # ollama + worker, both GPU-reserved
-├── .env.example            # SD_MOUNT, DATA_DIR
+├── docker-compose.yml      # vllm + worker (GPU-reserved); ollama opt-in profile
+├── .env.example            # SD_MOUNT, DATA_DIR, HOST_UID/GID, VLLM_GPU_UTIL
 └── worker/
     ├── Dockerfile          # CUDA 12.8 base (Blackwell), torch cu128, ultralytics
     ├── requirements.txt
@@ -31,8 +33,8 @@ Output lives under `DATA_DIR`:
 ```
 data/
   ingested_hashes.txt        # dedup ledger (one sha1 per line)
-  clips/2026-06-23/<clip_id>/
-    original.mp4             # read-only, never modified
+  clips/2026-06-20/<clip_id>/
+    original.avi             # read-only, never modified (real extension preserved)
     manifest.json           # state + verdict
 ```
 
@@ -41,41 +43,50 @@ data/
 Prereqs on CachyOS:
 
 ```bash
-sudo pacman -S nvidia-open nvidia-container-toolkit docker docker-compose
+sudo pacman -S nvidia-open nvidia-container-toolkit docker docker-buildx docker-compose
 sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
 sudo systemctl enable --now docker
+sudo usermod -aG docker $USER    # then re-login (or `newgrp docker`)
 ```
 
 First run:
 
 ```bash
-cp .env.example .env                       # edit SD_MOUNT, DATA_DIR
-docker compose up -d ollama
-docker exec dv-ollama ollama pull qwen3-vl:8b
-docker compose run --rm worker             # ingest + detect + review
+cp .env.example .env                       # edit SD_MOUNT, DATA_DIR, HOST_UID/GID
+docker compose up -d vllm                  # first boot: ~7.6 GB weight download + ~2 min kernel JIT
+docker compose run --rm worker run         # ingest + detect + review
 docker compose run --rm worker list        # show the pending-review queue
 ```
+
+`vllm` is healthchecked, so `worker` waits until the model is ready. The 8B is
+served as the AWQ 4-bit quant to fit 12 GB; tune `VLLM_GPU_UTIL` in `.env`
+(0.80 to coexist with a desktop, up to ~0.92 headless).
 
 Daily (host cron / systemd timer):
 
 ```
-0 20 * * *  cd /path/to/repo && docker compose run --rm worker
+0 20 * * *  cd /path/to/repo && docker compose up -d vllm && docker compose run --rm worker run
 ```
 
 ## Run natively (no Docker)
 
-Useful for fast iteration on this machine. Needs `ffmpeg`/`ffprobe` and a local
-Ollama; `ultralytics`/`torch` are only needed when the YOLO gate is enabled.
+Useful for fast iteration on this machine. Needs `ffmpeg`/`ffprobe` and a
+reachable VLM endpoint (e.g. the `vllm` container on `:8000`, or any
+OpenAI-compatible server). `ultralytics`/`torch` are only needed when the YOLO
+gate is enabled.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate    # bash; fish: source .venv/bin/activate.fish
 pip install -r worker/requirements.txt                # or: pip install requests pyyaml  (VLM-only)
 
-# point the VLM at a local ollama and pass paths explicitly
-export OLLAMA_BASE_URL=http://localhost:11434
+# point the worker at the running vLLM server and pass paths explicitly
+export VLM_BASE_URL=http://localhost:8000 VLM_MODEL=qwen3-vl
 python worker/pipeline.py run  --sd /path/to/sd --data ./data
 python worker/pipeline.py list --data ./data
 ```
+
+`VLM_BASE_URL`/`VLM_MODEL` override `config.yaml` (and the compose stack sets
+them). `OLLAMA_BASE_URL` is still honoured for the opt-in Ollama path.
 
 To skip YOLO during early testing, set `detect.use_yolo_prefilter: false` in
 `worker/config.yaml` — then every ingested clip goes straight to the VLM and
@@ -97,8 +108,9 @@ neither torch nor ultralytics is imported.
 ## Review a flagged clip with mpv
 
 ```bash
-M=data/clips/2026-06-23/<clip_id>/manifest.json
-mpv --start=$(jq -r '.violations[0].frame_time' "$M") "$(dirname "$M")/original.mp4"
+M=data/clips/2026-06-20/<clip_id>/manifest.json
+mpv --start=$(jq -r '.violations[0].frame_time' "$M") \
+    "$(dirname "$M")/$(jq -r '.video' "$M")"
 ```
 
 The interactive mpv-IPC approve/reject loop (writing `approved`/`rejected` back

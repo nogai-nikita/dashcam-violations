@@ -40,19 +40,35 @@ Drop this in the repo root. The accompanying scaffold (`docker-compose.yml`,
 The desktop **RTX 5070 has 12 GB of GDDR7** (192-bit, ~672 GB/s, Blackwell).
 That puts it in the 7B–13B vision-model tier.
 
-**Chosen VLM: `qwen3-vl:8b`.**
+**Chosen VLM: Qwen3-VL-8B** (served as `cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit`).
 - Native video understanding with timestamp-grounded event localisation — well
   suited to "find the moment a violation happens."
-- At Q4/Q5 it needs roughly **9 GB**, plus **1–2 GB** for video/image frames —
-  comfortable in 12 GB with headroom for the YOLO gate alongside.
 - The 30B-A3B MoE variant wants ~14–16 GB → too tight once frames are added.
 
-**Serving:** Ollama (OpenAI-compatible endpoint, single `ollama pull`,
-simplest). Switch to **vLLM** later if batched throughput across a day's clips
-becomes the bottleneck.
+**Serving: vLLM, not Ollama** (this changed during bring-up — see below).
+vLLM runs the *entire* model, including the vision encoder, on the GPU and serves
+the same OpenAI-compatible `/v1/chat/completions`. Measured on this box: **~0.2 s
+per 8-frame call warm** (≈4 s/clip end-to-end incl. frame extraction).
 
-> Blackwell needs a recent stack: NVIDIA driver 570+, CUDA 12.8+, and the
-> NVIDIA Container Toolkit. Older CUDA base images won't see the card.
+> **Why not Ollama (the original plan).** Ollama was tried first. On a 12 GB
+> card it refuses to offload Qwen3-VL's multimodal projector to the GPU
+> (`--no-mmproj-offload`, `reason=limited-vram`) and runs the vision encoder
+> (`CLIP using CPU backend`) on the CPU — **~16 s per frame, ~2 min/clip**, GPU
+> idle at ~0–2 %. Confirmed at context 2048/4096/8192/16384 and with q8 KV +
+> flash attention; none moved it to GPU. It is *not* a Blackwell support gap
+> (the CUDA build includes sm_120). Ollama remains available as an opt-in
+> fallback (`docker compose --profile ollama`), but it is CPU-bound here.
+
+> **Fitting 8B in 12 GB under vLLM.** bf16 (~16 GB) and FP8 (~10.6 GB) both OOM
+> once KV cache + GPU vision activations are added. The **AWQ 4-bit** quant of
+> the 8B (~7.6 GB) fits with room to spare; `Qwen/Qwen3-VL-4B-Instruct-FP8`
+> (~6 GB) is the fallback if more headroom is wanted. Note this is a *desktop*
+> GPU — KDE/Chrome/VSCode hold ~1.8 GB, so `--gpu-memory-utilization` is kept at
+> 0.80 to coexist (raise toward 0.92 for a headless nightly run).
+
+> Blackwell needs a recent stack: NVIDIA driver 570+ (this box: 610), CUDA 12.8+,
+> and the NVIDIA Container Toolkit. The worker uses a CUDA 12.8 base; vLLM uses
+> the `cu129-nightly` image (sm_120 kernels). Older CUDA images won't see the card.
 
 ---
 
@@ -144,7 +160,7 @@ data/
   clips/
     2026-06-23/
       a1b2c3d4e5f6/
-        original.mp4         # read-only, never modified
+        original.avi         # read-only, never modified (real extension kept)
         manifest.json        # state + verdict
         thumbs/              # extracted candidate frames (optional)
 ```
@@ -171,7 +187,8 @@ send everything to the VLM during early testing.
 
 ## 7. VLM interface
 
-- **Endpoint:** Ollama OpenAI-compatible `POST /v1/chat/completions`.
+- **Endpoint:** OpenAI-compatible `POST /v1/chat/completions` (default vLLM;
+  Ollama opt-in — both speak the same API).
 - **Message:** one text block (prompt) + N image blocks (base64 JPEG data URLs,
   sampled across the candidate window).
 - **Prompt structure:** role framing ("review OTHER road users, not the camera
@@ -185,31 +202,34 @@ send everything to the VLM during early testing.
   audit, treat as no-violation).
 
 Rules live in `worker/config.yaml` and are the main accuracy lever — edit
-wording, add/remove rules, tune `vlm_frames_per_window` and `vlm_min_confidence`.
+wording, add/remove rules, tune `vlm.frames_per_window` and `vlm.min_confidence`.
 
 ---
 
 ## 8. Stack & reproducibility
 
-- **`docker-compose.yml`** — two services:
-  - `ollama` (GPU-reserved) serving the VLM.
+- **`docker-compose.yml`** — services:
+  - `vllm` (GPU-reserved) serving Qwen3-VL on the GPU; healthchecked so the
+    worker waits until it is ready. Reuses a `dashcam_hf_cache` volume for weights.
   - `worker` (GPU-reserved for YOLO) running the pipeline; SD mounted read-only,
-    `data/` mounted read-write.
+    `data/` mounted read-write; runs as the host UID/GID so `data/` stays yours.
+  - `ollama` (opt-in, `--profile ollama`) — CPU-bound vision here; see §2.
 - **CachyOS setup:**
   ```bash
-  sudo pacman -S nvidia-open nvidia-container-toolkit docker docker-compose
+  sudo pacman -S nvidia-open nvidia-container-toolkit docker docker-buildx docker-compose
   sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+  sudo usermod -aG docker $USER   # then re-login (or `newgrp docker`)
   ```
 - **First run:**
   ```bash
-  cp .env.example .env            # SD_MOUNT, DATA_DIR
-  docker compose up -d ollama
-  docker exec dv-ollama ollama pull qwen3-vl:8b
-  docker compose run --rm worker
+  cp .env.example .env            # SD_MOUNT, DATA_DIR, HOST_UID/GID, VLLM_GPU_UTIL
+  docker compose up -d vllm       # first boot downloads ~7.6 GB weights + JITs kernels (~2 min)
+  docker compose run --rm worker run
+  docker compose run --rm worker list
   ```
 - **Daily schedule** (host cron / systemd timer):
   ```
-  0 20 * * *  cd /path/to/repo && docker compose run --rm worker
+  0 20 * * *  cd /path/to/repo && docker compose up -d vllm && docker compose run --rm worker run
   ```
 
 ---
@@ -218,8 +238,9 @@ wording, add/remove rules, tune `vlm_frames_per_window` and `vlm_min_confidence`
 
 Jump to the flagged moment:
 ```bash
-mpv --start=$(jq -r '.violations[0].frame_time' manifest.json) original.mp4
+mpv --start=$(jq -r '.violations[0].frame_time' manifest.json) "$(jq -r '.video' manifest.json)"
 ```
+(The ingested original keeps its real extension, e.g. `original.avi`.)
 For the review UI, run mpv with `--input-ipc-server=/tmp/mpvsock` and drive
 seek/play over its JSON IPC socket, writing `approved`/`rejected` back to the
 manifest.
@@ -231,7 +252,7 @@ manifest.
 - VLM output is a **proposal, not evidence** — hence the human-approval step.
   Keep the raw model output in the manifest for audit.
 - Expect false positives from glare, occlusion, ambiguous signals, night. Tune
-  the YOLO gate and `vlm_min_confidence` to control queue volume.
+  the YOLO gate and `vlm.min_confidence` to control queue volume.
 - **Evidence integrity:** never modify the original; do all work on copies/frames.
 - **Legal:** whether approved records can be acted on — reported, and to whom —
   varies by jurisdiction. Some countries run official citizen-report portals;
@@ -243,15 +264,19 @@ manifest.
 
 ## 11. Build status
 
-**Done (in scaffold):** ingest + content-hash dedup, organize, optional YOLO
-gate, VLM verdict via Ollama, file-based `pending_review` queue, daily-runnable
-via Compose.
+**Done & validated on real footage (TR10 card, RTX 5070):** ingest +
+content-hash dedup (re-dump is a no-op), organize with original-extension
+preservation + read-only originals, filename-derived capture dates, YOLO gate on
+GPU, **VLM verdict via vLLM on GPU** (~4 s/clip), file-based `pending_review`
+queue, host-user-owned `data/`, daily-runnable via Compose (vllm healthcheck →
+worker).
 
 **Next tasks (suggested order):**
 1. **Review UI + mpv IPC** — close the human-approval loop (list pending →
    play at `frame_time` → write status). The one manual gap today.
 2. **VLM prompt + rules tuning** — biggest accuracy lever; iterate on wording and
-   frames-per-window against real clips.
+   frames-per-window against real clips. (Early subset all `cleared`; needs a
+   labelled positive to calibrate `min_confidence` and prompt wording.)
 3. **Dedicated ALPR** — replace VLM plate-guessing with a real plate reader
    (lift Predator's) for reliable identification.
 4. **GPS/GPX correlation** — stamp each record with location from embedded telemetry.
@@ -263,10 +288,14 @@ via Compose.
 ## 12. Open questions
 
 - **Jurisdiction** — which country? Determines whether/where approved records can
-  be reported, which shapes the export stage.
-- **Dashcam telemetry format** — does the unit embed GPS/speed (and in what form)?
-  Needed for §11 task 4 and for speed-based rules.
-- **Cameras** — front only, or front+rear? Affects which rules are detectable.
+  be reported, which shapes the export stage. *(Still open.)*
+- ~~**Dashcam telemetry format**~~ — **Answered:** the unit is a **TR10**; each
+  `.avi` carries GPS/accelerometer telemetry in **subtitle tracks**
+  (`gpsStat=1, accelerStat=1`). Usable for §11 task 4 / speed-based rules — needs
+  a subtitle-track parser.
+- ~~**Cameras**~~ — **Answered:** **front + rear**, both muxed as two 1080p30
+  video streams in one `.avi`. The pipeline currently samples the default (front)
+  stream; rear is available as a second stream for rear-facing rules.
 
 ---
 

@@ -15,3 +15,7 @@ venv/
 
 # YOLO auto-downloaded weights when run natively
 *.pt
+
+# scratch dev helpers
+scratch_*
+/test_sd_big/

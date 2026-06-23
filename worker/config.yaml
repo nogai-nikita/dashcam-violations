@@ -27,7 +27,11 @@ ingest:
 detect:
   use_yolo_prefilter: true
   model: yolov8n.pt             # auto-downloaded by ultralytics on first use
-  device: ""                    # "" = auto (cuda if available), or "cpu" / "0"
+  # CPU by default: vLLM saturates the 12 GB GPU (~9.6 GB) so a GPU YOLO gate has
+  # almost no headroom and can OOM. yolov8n on CPU is cheap (~1 fps sampling).
+  # Set to "0" for GPU only if you lower VLLM_GPU_UTIL to free room (or run the
+  # gate in a separate pass while vLLM is down).
+  device: "cpu"                 # "cpu" | "0" (gpu) | "" (auto)
   sample_fps: 1.0               # frames per second of video to sample for the gate
   imgsz: 640
   conf: 0.35                    # YOLO detection confidence floor
@@ -44,15 +48,17 @@ detect:
     - stop sign
 
 # ---------------------------------------------------------------------------
-# Review — the VLM judgment (Ollama, OpenAI-compatible endpoint).
+# Review — the VLM judgment. Any OpenAI-compatible endpoint works; the default
+# stack serves Qwen3-VL on the GPU via vLLM (see docker-compose.yml). Override
+# base_url/model with VLM_BASE_URL / VLM_MODEL env vars (compose sets these).
 # ---------------------------------------------------------------------------
 vlm:
-  base_url: http://ollama:11434   # native run: override to http://localhost:11434
-  model: qwen3-vl:8b
-  frames_per_window: 6            # frames sampled across the clip and sent to the VLM
-                                  # NB: each ~1280px frame ≈ 1k vision tokens, so the
-                                  # Ollama server's OLLAMA_CONTEXT_LENGTH (set in
-                                  # docker-compose.yml) must exceed frames*~1k + prompt.
+  base_url: http://vllm:8000      # native run: override to http://localhost:8000
+  model: qwen3-vl                 # vLLM --served-model-name (Ollama path: qwen3-vl:8b)
+  frames_per_window: 8            # frames sampled across the clip and sent to the VLM.
+                                  # vLLM on GPU makes frames cheap (~0.2s/call), so we
+                                  # sample more for temporal coverage. Keep
+                                  # frames * ~750 vision tokens + prompt < max-model-len.
   jpeg_quality: 85
   max_frame_width: 1280           # downscale wide frames before base64 (VRAM/bandwidth)
   min_confidence: 0.55            # keep only violations at/above this -> pending_review

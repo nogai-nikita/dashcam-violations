@@ -6,7 +6,7 @@ writes per-clip manifest.json files; re-running any stage is safe.
 
     ingest  -> hash + dedup + copy + organize, write initial manifest
     detect  -> cheap YOLO gate: candidate vs cleared
-    review  -> VLM judgment via Ollama: structured verdict -> pending_review
+    review  -> VLM judgment (vLLM by default): structured verdict -> pending_review
     list    -> show the pending-review queue
     run     -> ingest + detect + review in sequence
 
@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ ST_INGESTED = "ingested"
 ST_CANDIDATE = "candidate"
 ST_CLEARED = "cleared"
 ST_PENDING = "pending_review"
+ST_ERROR = "error"        # video could not be decoded — surfaced, not silently cleared
 
 HERE = Path(__file__).resolve().parent
 
@@ -49,11 +51,15 @@ def load_config(path: Path) -> dict:
     with open(path) as fh:
         cfg = yaml.safe_load(fh)
 
-    # Env / CLI overrides are applied by the caller; here we only resolve the
-    # endpoint env override since it is purely environmental.
-    env_url = os.environ.get("OLLAMA_BASE_URL")
+    # Env overrides for the VLM endpoint/model so the serving backend (Ollama or
+    # vLLM — both OpenAI-compatible) is swappable without editing config.yaml.
+    # VLM_BASE_URL is preferred; OLLAMA_BASE_URL kept for back-compat.
+    env_url = os.environ.get("VLM_BASE_URL") or os.environ.get("OLLAMA_BASE_URL")
     if env_url:
         cfg.setdefault("vlm", {})["base_url"] = env_url
+    env_model = os.environ.get("VLM_MODEL")
+    if env_model:
+        cfg.setdefault("vlm", {})["model"] = env_model
     return cfg
 
 
@@ -203,6 +209,8 @@ def append_ledger(cfg: dict, digest: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a") as fh:
         fh.write(digest + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())  # durable: a half-written final line breaks dedup
 
 
 def iter_source_videos(sd_mount: Path, exts: list[str]) -> Iterable[Path]:
@@ -222,50 +230,77 @@ def ingest(cfg: dict) -> None:
     new_count = skip_count = 0
 
     for src in iter_source_videos(sd, icfg["video_extensions"]):
-        digest = hash_file(src, icfg["hash_algorithm"])
-        if digest in ledger:
-            skip_count += 1
-            continue
+        part = None
+        try:
+            digest = hash_file(src, icfg["hash_algorithm"])
+            if digest in ledger:
+                skip_count += 1
+                continue
 
-        clip_id = digest[: icfg["clip_id_length"]]
-        captured = (
-            parse_name_date(src.name)
-            or ffprobe_creation_date(src)
-            or dt.date.fromtimestamp(src.stat().st_mtime).isoformat()
-        )
-        clip_dir = clips_root(cfg) / captured / clip_id
-        clip_dir.mkdir(parents=True, exist_ok=True)
-        # Preserve the source container/extension byte-for-byte (evidence
-        # integrity): an .avi stays original.avi, never renamed to .mp4.
-        video_name = "original" + src.suffix.lower()
-        dest = clip_dir / video_name
+            clip_id = digest[: icfg["clip_id_length"]]
+            captured = (
+                parse_name_date(src.name)
+                or ffprobe_creation_date(src)
+                or dt.date.fromtimestamp(src.stat().st_mtime).isoformat()
+            )
+            clip_dir = clips_root(cfg) / captured / clip_id
+            # Preserve the source container/extension byte-for-byte (evidence
+            # integrity): an .avi stays original.avi, never renamed to .mp4.
+            video_name = "original" + src.suffix.lower()
+            dest = clip_dir / video_name
+            manifest_path = clip_dir / "manifest.json"
 
-        # Copy bytes, then make the original read-only (evidence integrity).
-        import shutil
-        shutil.copy2(src, dest)
-        if icfg.get("set_readonly", True):
-            os.chmod(dest, 0o444)
+            # Self-heal: an existing manifest means this clip was already
+            # ingested (e.g. a crash lost the ledger entry). Re-record the hash
+            # and skip — never re-copy over the read-only original.
+            if manifest_path.exists():
+                append_ledger(cfg, digest)
+                ledger.add(digest)
+                skip_count += 1
+                continue
 
-        manifest = {
-            "clip_id": clip_id,
-            "sha1": digest,
-            "source_name": src.name,
-            "captured_date": captured,
-            "ingested_at": now_iso(),
-            "video": video_name,
-            "duration_s": round(ffprobe_duration(dest), 2),
-            "candidate": None,
-            "yolo_hits": None,
-            "violations": [],
-            "vlm": None,
-            "reviewed_at": None,
-            "status": ST_INGESTED,
-        }
-        save_manifest(clip_dir / "manifest.json", manifest)
-        append_ledger(cfg, digest)
-        ledger.add(digest)
-        new_count += 1
-        log(f"ingest: + {src.name} -> {captured}/{clip_id}")
+            clip_dir.mkdir(parents=True, exist_ok=True)
+            # Atomic ingest: copy to a temp .part, then os.replace() into place.
+            # rename() replaces the destination atomically and — unlike copy —
+            # succeeds even if an old read-only original is already there
+            # (it needs dir write, not file write). A crash mid-copy leaves only
+            # a .part, never a half-written "original" and never a no-op-breaking
+            # PermissionError on the next run.
+            part = clip_dir / (video_name + ".part")
+            shutil.copy2(src, part)
+            os.replace(part, dest)
+            part = None
+            if icfg.get("set_readonly", True):
+                os.chmod(dest, 0o444)
+
+            manifest = {
+                "clip_id": clip_id,
+                "sha1": digest,
+                "source_name": src.name,
+                "captured_date": captured,
+                "ingested_at": now_iso(),
+                "video": video_name,
+                "duration_s": round(ffprobe_duration(dest), 2),
+                "candidate": None,
+                "yolo_hits": None,
+                "violations": [],
+                "vlm": None,
+                "reviewed_at": None,
+                "status": ST_INGESTED,
+            }
+            save_manifest(manifest_path, manifest)
+            append_ledger(cfg, digest)
+            ledger.add(digest)
+            new_count += 1
+            log(f"ingest: + {src.name} -> {captured}/{clip_id}")
+        except Exception as exc:
+            # One bad clip must not abort the whole scan.
+            log(f"ingest: ERROR on {src.name}: {exc} — skipping")
+            if part is not None:
+                try:
+                    part.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     log(f"ingest: {new_count} new, {skip_count} duplicates skipped")
 
@@ -302,7 +337,7 @@ def detect(cfg: dict, force: bool = False) -> None:
 
     triggers = set(dcfg["trigger_classes"])
     device = dcfg.get("device") or None
-    processed = candidates = 0
+    processed = candidates = errors = 0
 
     for mpath, m in iter_manifests(cfg):
         if m["status"] not in targets:
@@ -310,18 +345,26 @@ def detect(cfg: dict, force: bool = False) -> None:
         video = mpath.parent / m["video"]
         with tempfile.TemporaryDirectory() as td:
             frames = extract_gate_frames(video, dcfg["sample_fps"], Path(td))
+            if not frames:
+                # No decodable frames -> the clip is unreadable/corrupt. Flag it
+                # for attention instead of silently clearing it (which would
+                # drop the evidence from the queue forever).
+                m["status"] = ST_ERROR
+                save_manifest(mpath, m)
+                errors += 1
+                log(f"detect: {m['clip_id']} no frames decoded -> {ST_ERROR}")
+                continue
             hits = 0
-            if frames:
-                model = get_yolo(cfg)
-                results = model(
-                    [str(f) for f in frames], imgsz=dcfg["imgsz"],
-                    conf=dcfg["conf"], device=device, verbose=False,
-                )
-                names = model.names
-                for r in results:
-                    for c in r.boxes.cls.tolist():
-                        if names[int(c)] in triggers:
-                            hits += 1
+            model = get_yolo(cfg)
+            results = model(
+                [str(f) for f in frames], imgsz=dcfg["imgsz"],
+                conf=dcfg["conf"], device=device, verbose=False,
+            )
+            names = model.names
+            for r in results:
+                for c in r.boxes.cls.tolist():
+                    if names[int(c)] in triggers:
+                        hits += 1
 
         is_candidate = hits >= dcfg["min_hits"]
         m["yolo_hits"] = hits
@@ -332,11 +375,14 @@ def detect(cfg: dict, force: bool = False) -> None:
         candidates += int(is_candidate)
         log(f"detect: {m['clip_id']} hits={hits} -> {m['status']}")
 
-    log(f"detect: {processed} gated, {candidates} candidates")
+    msg = f"detect: {processed} gated, {candidates} candidates"
+    if errors:
+        msg += f", {errors} unreadable -> {ST_ERROR}"
+    log(msg)
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: review  (VLM judgment via Ollama OpenAI-compatible endpoint)
+# Stage 4: review  (VLM judgment via an OpenAI-compatible endpoint; vLLM default)
 # ---------------------------------------------------------------------------
 def build_prompt(cfg: dict, frame_times: list[float]) -> str:
     rules = cfg["rules"]
@@ -373,10 +419,15 @@ def parse_vlm_json(content: str) -> Optional[dict]:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)  # first balanced-ish object
-    if m:
+    # Decode just the first JSON object starting at the first '{', ignoring any
+    # trailing prose/objects. (A greedy `\{.*\}` would swallow trailing junk and
+    # fail on otherwise-recoverable output.)
+    start = text.find("{")
+    if start != -1:
         try:
-            return json.loads(m.group(0))
+            obj, _ = json.JSONDecoder().raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             return None
     return None
@@ -421,16 +472,23 @@ def review(cfg: dict, force: bool = False) -> None:
         video = mpath.parent / m["video"]
         duration = m.get("duration_s") or ffprobe_duration(video)
         times = sample_timestamps(duration, vc["frames_per_window"])
-        frames_b64 = []
+        # Keep timestamps in lockstep with the frames that actually decoded, so
+        # the per-frame timestamps in the prompt line up 1:1 with the images. If
+        # a middle frame fails to extract, dropping its timestamp too prevents
+        # mislabelling every later frame (which would misdirect the human-review
+        # jump-to-timestamp UX).
+        kept_times: list[float] = []
+        frames_b64: list[str] = []
         for ts in times:
             jpeg = extract_frame_jpeg(video, ts, vc["max_frame_width"], vc["jpeg_quality"])
             if jpeg:
+                kept_times.append(ts)
                 frames_b64.append(base64.b64encode(jpeg).decode("ascii"))
         if not frames_b64:
             log(f"review: {m['clip_id']} no frames extracted — skipping")
             continue
 
-        prompt = build_prompt(cfg, times[: len(frames_b64)])
+        prompt = build_prompt(cfg, kept_times)
         try:
             parsed, raw = call_vlm(cfg, prompt, frames_b64)
         except requests.RequestException as exc:
@@ -446,11 +504,15 @@ def review(cfg: dict, force: bool = False) -> None:
                     conf = float(v.get("confidence", 0))
                 except (TypeError, ValueError):
                     conf = 0.0
+                try:
+                    frame_time = float(v.get("frame_time", 0) or 0)
+                except (TypeError, ValueError):
+                    frame_time = 0.0  # VLM sometimes emits "3.5s"/"unknown"
                 if conf >= vc["min_confidence"]:
                     violations.append({
                         "rule_id": str(v.get("rule_id", "")),
                         "confidence": round(conf, 3),
-                        "frame_time": float(v.get("frame_time", 0) or 0),
+                        "frame_time": round(max(0.0, frame_time), 2),
                         "plate": str(v.get("plate", "")),
                         "description": str(v.get("description", "")),
                     })

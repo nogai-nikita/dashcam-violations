@@ -27,10 +27,13 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Writable ultralytics config dir, and bake the YOLO weights into the image so
-# ephemeral `docker compose run --rm worker` never re-downloads them at runtime.
+# Bake the YOLO weights into the image so ephemeral `docker compose run --rm
+# worker` never re-downloads them. The config dir is made world-writable because
+# the worker runs as an arbitrary host UID/GID (see compose `user:`), which must
+# still be able to write ultralytics' settings/cache there.
 RUN mkdir -p "$YOLO_CONFIG_DIR" \
-    && python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+    && python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" \
+    && chmod -R 777 "$YOLO_CONFIG_DIR"
 
 COPY config.yaml pipeline.py ./
 
