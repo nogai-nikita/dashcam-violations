@@ -147,6 +147,107 @@ def ffprobe_creation_date(video: Path) -> Optional[str]:
     return None
 
 
+def parse_gprmc(line: str) -> Optional[dict]:
+    """Parse one NMEA $GPRMC/$GNRMC sentence -> {utc, lat, lon, speed_kmh, course}.
+    Returns None unless the fix is valid (status 'A'). Field layout:
+    $GPRMC,hhmmss.ss,A,ddmm.mmmm,N,dddmm.mmmm,E,knots,course,DDMMYY,...*CS"""
+    f = line.split(",")
+    if len(f) < 10 or not f[0].endswith("RMC") or f[2] != "A":
+        return None
+    t, d = f[1], f[9]
+    if len(t) < 6 or len(d) < 6:
+        return None
+    try:
+        utc = dt.datetime(2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]),
+                          int(t[0:2]), int(t[2:4]), int(float(t[4:6])))
+    except ValueError:
+        return None
+
+    def to_deg(val: str, deg_len: int, hemi: str) -> Optional[float]:
+        if not val or "." not in val:
+            return None
+        deg = int(val[:deg_len]) + float(val[deg_len:]) / 60.0
+        return -deg if hemi in ("S", "W") else deg
+
+    lat = to_deg(f[3], 2, f[4])
+    lon = to_deg(f[5], 3, f[6])
+    if lat is None or lon is None:
+        return None
+    speed_kmh = round(float(f[7]) * 1.852, 1) if f[7] else None
+    course = float(f[8]) if f[8] else None
+    return {"utc": utc, "lat": round(lat, 6), "lon": round(lon, 6),
+            "speed_kmh": speed_kmh, "course": course}
+
+
+def extract_gps(video: Path, cfg: dict) -> Optional[dict]:
+    """First valid GPS fix in the clip: true UTC + local time + position.
+    Reads NMEA from the configured subtitle stream. Returns None if the clip has
+    no GPS / no valid fix (e.g. parking, cold start)."""
+    gcfg = cfg.get("gps", {})
+    if not gcfg.get("enabled", True):
+        return None
+    stream = gcfg.get("subtitle_stream", 0)
+    off = cfg.get("time", {}).get("local_utc_offset_hours", 0)
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video),
+         "-map", f"0:s:{stream}", "-c", "copy", "-f", "data", "-"],
+        capture_output=True,
+    )
+    if out.returncode != 0 or not out.stdout:
+        return None
+    # NMEA text is embedded in binary subtitle packets; pull clean sentences.
+    for m in re.finditer(rb"\$G[NP]RMC,[^\r\n*$]*\*[0-9A-Fa-f]{2}", out.stdout):
+        rec = parse_gprmc(m.group(0).decode("ascii", "ignore"))
+        if rec:
+            local = rec["utc"] + dt.timedelta(hours=off)
+            return {
+                "utc": rec["utc"].isoformat(),
+                "local": local.isoformat(),
+                "local_utc_offset_h": off,
+                "lat": rec["lat"], "lon": rec["lon"],
+                "speed_kmh": rec["speed_kmh"], "course": rec["course"],
+                "fix": "A",
+            }
+    return None
+
+
+def captured_from(video: Path, source_name: str, cfg: dict) -> dict:
+    """Resolve a clip's capture time/date in LOCAL (Bishkek) terms.
+    Prefers GPS UTC (ground truth) read from `video`; falls back to the dashcam
+    filename clock (`source_name`, which runs on KST) shifted to local. Returns
+    the fields merged into the manifest."""
+    gps = extract_gps(video, cfg)
+    if gps:
+        return {
+            "captured_date": gps["local"][:10],
+            "captured_local": gps["local"],
+            "captured_utc": gps["utc"],
+            "captured_source": "gps",
+            "gps": gps,
+        }
+    # No GPS fix: shift the filename clock (dashcam tz) to local.
+    tcfg = cfg.get("time", {})
+    shift = tcfg.get("local_utc_offset_hours", 0) - tcfg.get("dashcam_clock_utc_offset_hours", 0)
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})[_-]?(\d{2})?(\d{2})?(\d{2})?", source_name or "")
+    if m:
+        y, mo, d, hh, mi, ss = (int(x) if x else 0 for x in m.groups())
+        try:
+            local = dt.datetime(y, mo, d, hh, mi, ss) + dt.timedelta(hours=shift)
+            return {
+                "captured_date": local.date().isoformat(),
+                "captured_local": local.isoformat(),
+                "captured_utc": None,
+                "captured_source": "filename",
+                "gps": None,
+            }
+        except ValueError:
+            pass
+    # Last resort: mtime date, no tz adjustment possible.
+    d = dt.date.fromtimestamp(video.stat().st_mtime).isoformat()
+    return {"captured_date": d, "captured_local": None, "captured_utc": None,
+            "captured_source": "mtime", "gps": None}
+
+
 def _jpeg_qscale(quality: int) -> int:
     # Map 0-100 (higher=better) to ffmpeg mjpeg -q:v 2-31 (lower=better).
     quality = max(1, min(100, quality))
@@ -238,11 +339,11 @@ def ingest(cfg: dict) -> None:
                 continue
 
             clip_id = digest[: icfg["clip_id_length"]]
-            captured = (
-                parse_name_date(src.name)
-                or ffprobe_creation_date(src)
-                or dt.date.fromtimestamp(src.stat().st_mtime).isoformat()
-            )
+            # Resolve capture time in LOCAL terms from GPS UTC (ground truth),
+            # falling back to the dashcam filename clock. The local date is the
+            # folder key.
+            cap = captured_from(src, src.name, cfg)
+            captured = cap["captured_date"]
             clip_dir = clips_root(cfg) / captured / clip_id
             # Preserve the source container/extension byte-for-byte (evidence
             # integrity): an .avi stays original.avi, never renamed to .mp4.
@@ -283,7 +384,11 @@ def ingest(cfg: dict) -> None:
                 "clip_id": clip_id,
                 "sha1": digest,
                 "source_name": src.name,
-                "captured_date": captured,
+                "captured_date": captured,           # local (Bishkek) date
+                "captured_local": cap["captured_local"],
+                "captured_utc": cap["captured_utc"],
+                "captured_source": cap["captured_source"],
+                "gps": cap["gps"],
                 "ingested_at": now_iso(),
                 "video": video_name,
                 "duration_s": round(ffprobe_duration(dest), 2),
@@ -298,7 +403,7 @@ def ingest(cfg: dict) -> None:
             append_ledger(cfg, digest)
             ledger.add(digest)
             new_count += 1
-            log(f"ingest: + {src.name} -> {captured}/{clip_id}")
+            log(f"ingest: + {src.name} -> {captured}/{clip_id} [{cap['captured_source']}]")
         except Exception as exc:
             # One bad clip must not abort the whole scan.
             log(f"ingest: ERROR on {src.name}: {exc} — skipping")
@@ -589,6 +694,58 @@ def list_pending(cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backfill: re-stamp existing clips with GPS UTC + local time, and move any
+# that were filed under the wrong (dashcam-clock) date to their correct local
+# date folder. Idempotent: clips already stamped and in the right folder are
+# skipped, so re-running is cheap.
+# ---------------------------------------------------------------------------
+def backfill_gps(cfg: dict) -> None:
+    root = clips_root(cfg)
+    stamped = moved = nogps = skipped = errors = 0
+    for mpath, m in list(iter_manifests(cfg)):
+        try:
+            folder_date = mpath.parent.parent.name
+            if m.get("captured_source") and m.get("captured_date") == folder_date:
+                skipped += 1
+                continue  # already backfilled and correctly filed
+
+            video = mpath.parent / m.get("video", "")
+            if not video.exists():
+                errors += 1
+                log(f"backfill: {m.get('clip_id')} missing video — skip")
+                continue
+
+            cap = captured_from(video, m.get("source_name", ""), cfg)
+            m.update(cap)
+            stamped += 1
+            if cap["captured_source"] != "gps":
+                nogps += 1
+
+            new_date = cap["captured_date"]
+            save_manifest(mpath, m)
+            if new_date != folder_date:
+                old_dir = mpath.parent
+                new_dir = root / new_date / old_dir.name
+                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                if new_dir.exists():
+                    log(f"backfill: {m['clip_id']} target {new_date} exists — left in place")
+                else:
+                    os.replace(old_dir, new_dir)
+                    moved += 1
+                    try:
+                        old_dir.parent.rmdir()  # remove the now-empty date folder
+                    except OSError:
+                        pass
+                    log(f"backfill: {m['clip_id']} {folder_date} -> {new_date} "
+                        f"({cap['captured_source']})")
+        except Exception as exc:
+            errors += 1
+            log(f"backfill: ERROR on {m.get('clip_id')}: {exc}")
+    log(f"backfill: {stamped} stamped ({nogps} without GPS), {moved} moved to "
+        f"correct date, {skipped} already done, {errors} errors")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def apply_overrides(cfg: dict, args: argparse.Namespace) -> None:
@@ -602,8 +759,10 @@ def apply_overrides(cfg: dict, args: argparse.Namespace) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Local dashcam violation pipeline")
-    p.add_argument("stage", choices=["ingest", "detect", "review", "list", "run"],
-                   help="pipeline stage to run ('run' = ingest+detect+review)")
+    p.add_argument("stage",
+                   choices=["ingest", "detect", "review", "list", "run", "backfill-gps"],
+                   help="pipeline stage to run ('run' = ingest+detect+review; "
+                        "'backfill-gps' re-stamps/re-dates existing clips from GPS)")
     p.add_argument("--config", default=str(HERE / "config.yaml"))
     p.add_argument("--sd", help="override SD mount path")
     p.add_argument("--data", help="override data dir path")
@@ -622,6 +781,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         review(cfg, force=args.force)
     if args.stage == "list":
         list_pending(cfg)
+    if args.stage == "backfill-gps":
+        backfill_gps(cfg)
     return 0
 
 

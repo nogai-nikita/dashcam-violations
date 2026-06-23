@@ -20,6 +20,19 @@ ingest:
   set_readonly: true            # chmod the copied original to 0444 (evidence integrity)
 
 # ---------------------------------------------------------------------------
+# Time & location. The dashcam clock runs on Korea time (UTC+9 — never reset
+# after import); the embedded GPS gives true UTC. captured_date is the
+# LOCAL date where the car is (Bishkek, UTC+6), taken from GPS when available,
+# else from the filename (KST) shifted by (local - dashcam_clock).
+# ---------------------------------------------------------------------------
+gps:
+  enabled: true
+  subtitle_stream: 0            # NMEA $GPRMC lives in subtitle stream 0 on the TR10
+time:
+  local_utc_offset_hours: 6            # Bishkek (UTC+6, no DST) — where the car is
+  dashcam_clock_utc_offset_hours: 9    # the TR10's filename/overlay clock (KST, UTC+9)
+
+# ---------------------------------------------------------------------------
 # Detect — the cheap YOLO gate. Most footage is empty road; the gate keeps the
 # VLM bill to minutes/day. Set use_yolo_prefilter:false to send everything to
 # the VLM during early testing (then torch/ultralytics aren't even imported).
