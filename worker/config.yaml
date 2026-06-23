@@ -1,0 +1,84 @@
+# Dashcam violation pipeline — configuration.
+# This file is the main accuracy lever. Edit rule wording, thresholds, and the
+# YOLO trigger set; re-run `pipeline.py review` to re-evaluate (it is idempotent).
+
+# ---------------------------------------------------------------------------
+# Paths. Defaults assume the Docker layout; the env vars (SD_MOUNT / DATA_DIR)
+# set in .env override these. Native runs can also pass --sd / --data on the CLI.
+# ---------------------------------------------------------------------------
+paths:
+  sd_mount: /sd        # read-only source (the dumped SD card)
+  data_dir: /data      # read-write working area (clips/, ingested_hashes.txt)
+
+# ---------------------------------------------------------------------------
+# Ingest. Dashcams reuse filenames, so dedup is by content hash, never by name.
+# ---------------------------------------------------------------------------
+ingest:
+  video_extensions: [".mp4", ".mov", ".avi", ".mkv", ".ts"]
+  hash_algorithm: sha1          # ledger keys; sha1 is plenty for dedup
+  clip_id_length: 12            # first N hex chars of the hash -> clip_id / folder
+  set_readonly: true            # chmod the copied original to 0444 (evidence integrity)
+
+# ---------------------------------------------------------------------------
+# Detect — the cheap YOLO gate. Most footage is empty road; the gate keeps the
+# VLM bill to minutes/day. Set use_yolo_prefilter:false to send everything to
+# the VLM during early testing (then torch/ultralytics aren't even imported).
+# ---------------------------------------------------------------------------
+detect:
+  use_yolo_prefilter: true
+  model: yolov8n.pt             # auto-downloaded by ultralytics on first use
+  device: ""                    # "" = auto (cuda if available), or "cpu" / "0"
+  sample_fps: 1.0               # frames per second of video to sample for the gate
+  imgsz: 640
+  conf: 0.35                    # YOLO detection confidence floor
+  min_hits: 4                   # >= this many trigger detections -> candidate
+  # COCO class names that count as "traffic activity worth a VLM look".
+  trigger_classes:
+    - car
+    - truck
+    - bus
+    - motorcycle
+    - bicycle
+    - person
+    - traffic light
+    - stop sign
+
+# ---------------------------------------------------------------------------
+# Review — the VLM judgment (Ollama, OpenAI-compatible endpoint).
+# ---------------------------------------------------------------------------
+vlm:
+  base_url: http://ollama:11434   # native run: override to http://localhost:11434
+  model: qwen3-vl:8b
+  frames_per_window: 6            # frames sampled across the clip and sent to the VLM
+                                  # NB: each ~1280px frame ≈ 1k vision tokens, so the
+                                  # Ollama server's OLLAMA_CONTEXT_LENGTH (set in
+                                  # docker-compose.yml) must exceed frames*~1k + prompt.
+  jpeg_quality: 85
+  max_frame_width: 1280           # downscale wide frames before base64 (VRAM/bandwidth)
+  min_confidence: 0.55            # keep only violations at/above this -> pending_review
+  timeout_seconds: 300
+  temperature: 0.1
+
+# ---------------------------------------------------------------------------
+# Rules — injected into the VLM prompt. The model reviews OTHER road users, not
+# the camera car. rule_id values are what the model must echo back in its JSON.
+# ---------------------------------------------------------------------------
+rules:
+  - id: red_light
+    text: A vehicle enters the intersection or crosses the stop line after the
+          traffic light facing it has turned red.
+  - id: stop_sign
+    text: A vehicle fails to come to a complete stop at a stop sign before
+          proceeding (rolling through counts).
+  - id: wrong_way
+    text: A vehicle travels against the legal direction of traffic (wrong way on
+          a one-way street or in an oncoming lane).
+  - id: illegal_overtake
+    text: A vehicle overtakes across a solid centre line or in a no-passing zone.
+  - id: no_signal_lane_change
+    text: A vehicle changes lanes or turns without signalling.
+  - id: phone_use
+    text: A driver is visibly holding/using a phone while driving.
+  - id: failure_to_yield
+    text: A vehicle fails to yield to a pedestrian in a crosswalk or to traffic
+          with right-of-way.

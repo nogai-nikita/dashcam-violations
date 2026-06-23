@@ -1,0 +1,8 @@
+# VLM HTTP + config
+requests>=2.31
+PyYAML>=6.0
+
+# YOLO gate. ultralytics pulls torch/torchvision + opencv + numpy + pillow.
+# The torch build (CUDA 12.8 for Blackwell/RTX 5070) is installed separately in
+# the Dockerfile from the cu128 index; ultralytics here picks up that torch.
+ultralytics>=8.3.0

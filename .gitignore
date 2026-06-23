@@ -1,0 +1,17 @@
+# Local secrets / config
+.env
+
+# Ingested footage, manifests, dedup ledger — data, not source.
+/data/
+
+# Local test subset of real footage (never commit footage)
+/test_sd/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# YOLO auto-downloaded weights when run natively
+*.pt

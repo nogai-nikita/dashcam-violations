@@ -1,0 +1,58 @@
+# Two services: ollama serves the VLM, worker runs the pipeline.
+# Both reserve the GPU via the NVIDIA Container Toolkit.
+#
+#   cp .env.example .env          # set SD_MOUNT, DATA_DIR
+#   docker compose up -d ollama
+#   docker exec dv-ollama ollama pull qwen3-vl:8b
+#   docker compose run --rm worker            # full pipeline (run)
+#   docker compose run --rm worker list       # show the pending queue
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dv-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      # Default context is 4096; 6 vision frames need ~7k tokens. Must be >=
+      # vlm.frames_per_window worth of image tokens + prompt + output.
+      OLLAMA_CONTEXT_LENGTH: "16384"
+      # Keep the model resident between clips so each review doesn't reload 9 GB.
+      OLLAMA_KEEP_ALIVE: "30m"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: dv-worker
+    # Run as the host user so ingested clips/manifests in DATA_DIR are owned by
+    # you (not root) and stay easy to review, back up, and delete.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    depends_on:
+      - ollama
+    environment:
+      # pipeline.py reads these; they override config.yaml paths.
+      SD_MOUNT: /sd
+      DATA_DIR: /data
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - ${SD_MOUNT:?set SD_MOUNT in .env}:/sd:ro   # SD card mounted READ-ONLY
+      - ${DATA_DIR:?set DATA_DIR in .env}:/data     # working area, read-write
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ollama_models:
