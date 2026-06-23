@@ -80,20 +80,35 @@ class Mpv:
         )
         self.proc: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
+        self.alive = False
         self._buf = b""
         self._rid = 0
 
     def start(self) -> None:
+        """Initial launch. Raises if mpv isn't installed (so the caller can
+        fall back to --no-mpv mode); otherwise spawns and connects."""
         if shutil.which("mpv") is None:
             raise RuntimeError("mpv not found on PATH")
+        self._spawn()
+
+    def _spawn(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
         if os.path.exists(self.sock_path):
-            os.unlink(self.sock_path)
+            try:
+                os.unlink(self.sock_path)
+            except OSError:
+                pass
+        self._buf = b""
         self.proc = subprocess.Popen(
             ["mpv", "--idle=yes", "--force-window=yes", "--keep-open=yes",
              "--no-terminal", "--osd-level=1", "--osd-duration=4000",
              "--title=Dashcam review", f"--input-ipc-server={self.sock_path}"],
         )
-        # Wait for the IPC socket to appear and accept a connection.
         deadline = time.time() + 10
         while time.time() < deadline:
             if os.path.exists(self.sock_path):
@@ -101,6 +116,7 @@ class Mpv:
                     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     s.connect(self.sock_path)
                     self.sock = s
+                    self.alive = True
                     return
                 except OSError:
                     pass
@@ -109,18 +125,41 @@ class Mpv:
             time.sleep(0.1)
         raise RuntimeError("timed out waiting for mpv IPC socket")
 
+    def ensure_started(self) -> bool:
+        """Relaunch mpv if it died (e.g. the user closed the window). Returns
+        False only if mpv genuinely can't be (re)started."""
+        if self.proc is not None and self.proc.poll() is None and self.alive:
+            return True
+        try:
+            self._spawn()
+            return True
+        except RuntimeError:
+            self.alive = False
+            return False
+
     def _send(self, command: list) -> dict:
-        assert self.sock is not None
+        """Send a command; never raises — returns {"error": ...} on a dead pipe
+        so a closed mpv window degrades gracefully instead of crashing."""
+        if not self.alive or self.sock is None:
+            return {"error": "mpv-not-running"}
         self._rid += 1
         rid = self._rid
-        self.sock.sendall((json.dumps({"command": command, "request_id": rid}) + "\n").encode())
-        # Read newline-delimited JSON until our request_id's reply arrives,
-        # skipping asynchronous event messages.
+        try:
+            self.sock.sendall(
+                (json.dumps({"command": command, "request_id": rid}) + "\n").encode())
+        except OSError:
+            self.alive = False
+            return {"error": "send-failed"}
         deadline = time.time() + 10
         while time.time() < deadline:
             while b"\n" not in self._buf:
-                chunk = self.sock.recv(65536)
+                try:
+                    chunk = self.sock.recv(65536)
+                except OSError:
+                    self.alive = False
+                    return {"error": "recv-failed"}
                 if not chunk:
+                    self.alive = False
                     return {"error": "disconnected"}
                 self._buf += chunk
             line, self._buf = self._buf.split(b"\n", 1)
@@ -134,34 +173,43 @@ class Mpv:
                 return msg
         return {"error": "timeout"}
 
-    def play_at(self, video: Path, start: float) -> None:
-        """Load `video` and start playback `start` seconds in."""
-        self._send(["loadfile", str(video), "replace"])
+    def play_at(self, video: Path, start: float) -> bool:
+        """Load `video` and start playback `start` seconds in. Returns False if
+        mpv is unavailable (window closed and couldn't be relaunched)."""
+        if not self.ensure_started():
+            return False
+        if self._send(["loadfile", str(video), "replace"]).get("error"):
+            return False
         # Wait until the file is loaded (duration becomes available), then seek.
         deadline = time.time() + 10
         while time.time() < deadline:
             r = self._send(["get_property", "duration"])
             if isinstance(r.get("data"), (int, float)):
                 break
+            if r.get("error"):
+                return False
             time.sleep(0.1)
         self._send(["seek", max(0.0, start), "absolute", "exact"])
         self._send(["set_property", "pause", False])
+        return self.alive
 
     def osd(self, text: str) -> None:
-        self._send(["show-text", text, 4000])
+        if self.alive:
+            self._send(["show-text", text, 4000])
 
     def stop(self) -> None:
         try:
-            if self.sock is not None:
+            if self.sock is not None and self.alive:
                 self._send(["quit"])
                 self.sock.close()
         except OSError:
             pass
-        if self.proc is not None:
+        if self.proc is not None and self.proc.poll() is None:
             try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
                 self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                self.proc.kill()
         if os.path.exists(self.sock_path):
             try:
                 os.unlink(self.sock_path)
@@ -224,17 +272,19 @@ def review_queue(data_dir: Path, use_mpv: bool) -> int:
 
             def cue(i: int) -> None:
                 ft = float(violations[i].get("frame_time", 0) or 0)
+                played = False
                 if mpv is not None and video.exists():
-                    mpv.play_at(video, ft - PREROLL_S)
-                    mpv.osd(f"{m.get('clip_id')}  "
-                            f"{violations[i].get('rule_id','')} @ {ft:.1f}s")
+                    played = mpv.play_at(video, ft - PREROLL_S)
+                    if played:
+                        mpv.osd(f"{m.get('clip_id')}  "
+                                f"{violations[i].get('rule_id','')} @ {ft:.1f}s")
+                if not played:
+                    # mpv missing, window closed, or file unreadable — let the
+                    # reviewer still see the moment by hand without crashing.
+                    print(f"  ▶ play manually:  mpv --start={ft:.1f} '{video}'")
 
             describe(m, idx, len(pending))
-            if mpv is None:
-                ft = float(violations[0].get("frame_time", 0) or 0)
-                print(f"  play manually:  mpv --start={ft:.1f} '{video}'")
-            else:
-                cue(0)
+            cue(0)
 
             while True:
                 try:
