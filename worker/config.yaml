@@ -71,20 +71,28 @@ vlm:
 # ---------------------------------------------------------------------------
 rules:
   - id: red_light
-    text: A vehicle enters the intersection or crosses the stop line after the
-          traffic light facing it has turned red.
+    text: A vehicle crosses the stop line / enters the intersection while the
+          traffic signal FACING ITS OWN direction of travel is red. Do not report
+          cross-traffic moving across the camera's view (it has its own green),
+          and do not report unless the signal governing that vehicle is visibly
+          red.
   - id: stop_sign
-    text: A vehicle fails to come to a complete stop at a stop sign before
-          proceeding (rolling through counts).
+    text: At an intersection with a STOP sign and NO traffic light, a vehicle
+          clearly proceeds without stopping. If a traffic light controls the
+          intersection, the light governs — do not report a stop-sign violation
+          there. Do not infer a rolling stop from still frames.
   - id: wrong_way
     text: A vehicle travels against the legal direction of traffic (wrong way on
           a one-way street or in an oncoming lane).
   - id: illegal_overtake
     text: A vehicle overtakes across a solid centre line or in a no-passing zone.
   - id: no_signal_lane_change
-    text: A vehicle changes lanes or turns without signalling.
+    text: A vehicle visibly changes lanes or turns without signalling (only if a
+          lit indicator would be clearly visible from this angle).
   - id: phone_use
-    text: A driver is visibly holding/using a phone while driving.
+    text: The DRIVER of another vehicle is visibly holding/using a phone while at
+          the wheel. Never report pedestrians or passengers.
   - id: failure_to_yield
-    text: A vehicle fails to yield to a pedestrian in a crosswalk or to traffic
-          with right-of-way.
+    text: A vehicle fails to yield to a pedestrian already in a crosswalk, or
+          fails to yield where it is clearly required to and another road user
+          has the right of way.
