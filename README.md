@@ -21,6 +21,7 @@ SD card ─ingest─> organize ─detect (YOLO gate)─> review (VLM) ─> pendi
 .
 ├── docker-compose.yml      # vllm + worker (GPU-reserved); ollama opt-in profile
 ├── .env.example            # SD_MOUNT, DATA_DIR, HOST_UID/GID, VLLM_GPU_UTIL
+├── review_ui.py            # host-side mpv review UI (approve/reject the queue)
 └── worker/
     ├── Dockerfile          # CUDA 12.8 base (Blackwell), torch cu128, ultralytics
     ├── requirements.txt
@@ -105,16 +106,29 @@ neither torch nor ultralytics is imported.
 `--force` re-runs detect/review over already-processed clips (e.g. after tuning
 `config.yaml`). Re-dumping the same SD card is a no-op (content-hash dedup).
 
-## Review a flagged clip with mpv
+## Review the queue (human approve/reject)
+
+`review_ui.py` walks every `pending_review` clip, plays it in mpv jumped to the
+flagged moment, and writes `approved`/`rejected` back to the manifest. It is a
+**host tool** (drives the host's mpv + display), stdlib-only — run it with the
+system `python3`, no venv:
+
+```bash
+python3 review_ui.py --data ./data        # opens mpv; a/r/s/p/n/q per clip
+python3 review_ui.py --data ./data --no-mpv   # decide from the stills/CLI only
+```
+
+Keys: `[a]`pprove · `[r]`eject · `[s]`kip · `[p]`lay again · `[n]`ext violation ·
+`[q]`uit. A decision appends a `human_review` block (decision, reviewer,
+timestamp, note) for audit; the original clip is never touched.
+
+Or just jump to the moment by hand:
 
 ```bash
 M=data/clips/2026-06-20/<clip_id>/manifest.json
 mpv --start=$(jq -r '.violations[0].frame_time' "$M") \
     "$(dirname "$M")/$(jq -r '.video' "$M")"
 ```
-
-The interactive mpv-IPC approve/reject loop (writing `approved`/`rejected` back
-to the manifest) is the next task — see [SOLUTION.md](SOLUTION.md) §11.
 
 ## Status state machine
 

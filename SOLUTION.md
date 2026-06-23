@@ -272,11 +272,14 @@ queue, host-user-owned `data/`, daily-runnable via Compose (vllm healthcheck →
 worker).
 
 **Next tasks (suggested order):**
-1. **Review UI + mpv IPC** — close the human-approval loop (list pending →
-   play at `frame_time` → write status). The one manual gap today.
+1. ~~**Review UI + mpv IPC**~~ — **Done:** `review_ui.py` (host, stdlib-only)
+   walks the `pending_review` queue, plays each clip in mpv jumped to
+   `frame_time` over the JSON IPC socket, and writes `approved`/`rejected` +
+   a `human_review` audit block back to the manifest.
 2. **VLM prompt + rules tuning** — biggest accuracy lever; iterate on wording and
-   frames-per-window against real clips. (Early subset all `cleared`; needs a
-   labelled positive to calibrate `min_confidence` and prompt wording.)
+   frames-per-window against real clips. A 40-clip batch produced a plausible
+   `red_light` flag (conf 0.95, plate transcribed) — use approved/rejected
+   decisions to calibrate `min_confidence` and prompt wording.
 3. **Dedicated ALPR** — replace VLM plate-guessing with a real plate reader
    (lift Predator's) for reliable identification.
 4. **GPS/GPX correlation** — stamp each record with location from embedded telemetry.
@@ -307,6 +310,7 @@ worker).
 ├── SOLUTION.md              # this file
 ├── docker-compose.yml
 ├── .env.example
+├── review_ui.py             # host-side mpv review UI (approve/reject the queue)
 └── worker/
     ├── Dockerfile
     ├── requirements.txt
