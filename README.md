@@ -102,9 +102,17 @@ neither torch nor ultralytics is imported.
 | `pipeline.py review` | VLM judgment → `pending_review` or `cleared` |
 | `pipeline.py list`   | print the pending-review queue |
 | `pipeline.py run`    | ingest + detect + review |
+| `pipeline.py backfill-gps` | re-stamp existing clips from GPS + re-date to the correct local-date folder |
 
 `--force` re-runs detect/review over already-processed clips (e.g. after tuning
 `config.yaml`). Re-dumping the same SD card is a no-op (content-hash dedup).
+
+**Time & GPS.** Each clip is stamped from the embedded NMEA `$GPRMC` (subtitle
+stream 0): `captured_utc`, `captured_local`, and a `gps` block (lat/lon/speed).
+`captured_date` (the folder) is the **local** date. This matters because the TR10
+clock here runs on Korea time (UTC+9) while the car is in Bishkek (UTC+6) — see
+`config.yaml` `time.*`. Clips with no GPS fix fall back to the filename clock
+shifted to local.
 
 ## Review the queue (human approve/reject)
 

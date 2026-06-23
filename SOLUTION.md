@@ -281,8 +281,12 @@ worker).
    `red_light` flag (conf 0.95, plate transcribed) — use approved/rejected
    decisions to calibrate `min_confidence` and prompt wording.
 3. **Dedicated ALPR** — replace VLM plate-guessing with a real plate reader
-   (lift Predator's) for reliable identification.
-4. **GPS/GPX correlation** — stamp each record with location from embedded telemetry.
+   (lift Predator's) for reliable identification. (VLM plate reads are rough —
+   e.g. it read `01 101 TOM` as `СТ 101 ТОМ`.)
+4. ~~**GPS/GPX correlation**~~ — **Done:** the pipeline parses NMEA `$GPRMC` from
+   subtitle stream 0 and stamps each clip with `captured_utc`, `captured_local`,
+   and a `gps` block (lat/lon/speed). `backfill-gps` re-stamps existing clips.
+   Full per-clip track / GPX export is still open.
 5. **Export stage** — approved record bundle (+ optional plate/face blur via
    DashcamCleaner if sharing).
 
@@ -292,10 +296,14 @@ worker).
 
 - **Jurisdiction** — which country? Determines whether/where approved records can
   be reported, which shapes the export stage. *(Still open.)*
-- ~~**Dashcam telemetry format**~~ — **Answered:** the unit is a **TR10**; each
-  `.avi` carries GPS/accelerometer telemetry in **subtitle tracks**
-  (`gpsStat=1, accelerStat=1`). Usable for §11 task 4 / speed-based rules — needs
-  a subtitle-track parser.
+- ~~**Dashcam telemetry format**~~ — **Answered & parsed:** the **TR10** embeds
+  standard NMEA `$GPRMC` (UTC + lat/lon + speed) in **subtitle stream 0**
+  (`gpsStat=1, accelerStat=1`). The pipeline now reads it (see §11 task 4).
+- ~~**Timezone**~~ — **Answered:** the dashcam clock runs on **Korea time
+  (UTC+9)** — never reset after import — so filename/overlay timestamps are **3h
+  ahead of real Bishkek time (UTC+6)** and evening clips land on the wrong day.
+  GPS UTC is the source of truth; `captured_date` is now the GPS-derived local
+  (Bishkek) date. Offsets are in `config.yaml` (`time.*`).
 - ~~**Cameras**~~ — **Answered:** **front + rear**, both muxed as two 1080p30
   video streams in one `.avi`. The pipeline currently samples the default (front)
   stream; rear is available as a second stream for rear-facing rules.
