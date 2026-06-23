@@ -71,8 +71,10 @@ vlm:
 # ---------------------------------------------------------------------------
 rules:
   - id: red_light
-    text: A vehicle crosses the stop line / enters the intersection while the
-          traffic signal FACING ITS OWN direction of travel is red. Do not report
+    text: A vehicle is MOVING THROUGH the intersection / across the stop line
+          while the traffic signal FACING ITS OWN direction of travel is red. A
+          vehicle stopped or queued at a red (including one ahead of the ego car
+          while both are stopped) is complying — not a violation. Do not report
           cross-traffic moving across the camera's view (it has its own green),
           and do not report unless the signal governing that vehicle is visibly
           red.
